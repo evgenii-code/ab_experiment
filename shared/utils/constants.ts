@@ -1,0 +1,1 @@
+export const COOKIE_NAME_CATALOG_VARIANT = 'catalog-variant'
