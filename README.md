@@ -1,151 +1,192 @@
-# A/B-эксперимент с SSR-кешированием в Nuxt
+# A/B-эксперименты с SSR-кешем в Nuxt
 
-Вариант эксперимента назначается на стороне Nitro **до обращения к кешу**.
+Локальный модуль назначает независимые варианты `a`/`b` до обращения к кешу Nitro. Приложение читает их через `useExperimentVariant()`.
 
-Поэтому для страницы выбирается кеш нужного варианта, а при новой генерации HTML Nuxt получает тот же вариант через `useCookie()`.
+## Проблема
 
-Кеш разделяется по `x-catalog-variant`, а не по всему заголовку `Cookie`: посетители с вариантом `a` используют общий ответ для `a`, посетители с `b` — общий ответ для `b`.
+HTML зависит от варианта эксперимента, поэтому общий кеш страницы может вернуть посетителю чужой вариант. Разделение по всему заголовку `Cookie` тоже не подходит: персональные cookies создают множество отдельных записей.
 
-## Запуск
+Есть и проблема гидратации: внутри кешируемого обработчика Nitro оставляет только заголовки запроса из `cache.varies` и использует отдельные заголовки ответа. Поэтому SSR не видит ни исходный `Cookie`, ни `Set-Cookie`, выставленный middleware. Серверный `useCookie()` может получить пустое значение, хотя в браузере cookie уже есть.
 
-```bash
-bun install
-bun run dev
-```
+## Решение
 
-Dev-сервер доступен на `http://localhost:3000`.
+1. Nitro middleware определяет вариант, добавляет `Set-Cookie` в ответ и записывает вариант в заголовок запроса **до выбора кеша**.
+2. Nitro разделяет кеш по этому заголовку.
+3. Серверный Nuxt-плагин восстанавливает cookie из заголовка **до SSR**.
+4. `useExperimentVariant()` читает одинаковый вариант при SSR и гидратации через `useCookie()`.
 
-Сборка и локальный просмотр production-версии:
+| Страница | Эксперимент | Cookie | Заголовок кеша |
+| --- | --- | --- | --- |
+| `/` | `catalog` | `catalog-variant` | `x-catalog-variant` |
+| `/checkout` | `checkout` | `checkout-variant` | `x-checkout-variant` |
 
-```bash
-bun run build
-bun run preview
-```
+У каждой страницы два варианта кеша. Назначение checkout не влияет на кеш каталога, и наоборот.
 
-## Порядок обработки запроса
+## Флоу запроса
 
-```text
-Запрос браузера с cookies (или первый запрос без них)
-  ↓
-Nitro middleware: 00-experiment-cookie.ts
-  • читает или назначает bucket
-  • определяет вариант a/b
-  • при необходимости добавляет Set-Cookie в ответ браузеру
-  • записывает вариант в заголовок запроса x-catalog-variant
-  ↓
-Nitro выбирает ключ кеша по URL и x-catalog-variant
-  ├─ Свежий кеш → возвращает готовый HTML нужного варианта
-  ├─ Допустимый устаревший кеш → возвращает HTML и обновляет его в фоне
-  └─ Кеша нет → запускает SSR
-                  ↓
-      Nuxt-плагин: restore-experiment-cookie.server.ts
-        • восстанавливает catalog-variant в Cookie SSR-запроса
-                  ↓
-      app.vue читает вариант через useCookie()
-                  ↓
-      HTML сохраняется в кеше соответствующего варианта
-  ↓
-Браузер получает HTML и назначенные middleware cookies
-  ↓
-При гидратации useCookie() читает вариант из document.cookie
-```
+1. Браузер отправляет запрос страницы.
+2. Nitro middleware обрабатывает `GET` и `HEAD`. Для каждого эксперимента:
+   - Читает или создаёт собственный bucket.
+   - Вычисляет вариант `a` или `b`.
+   - При необходимости добавляет `Set-Cookie` в ответ.
+   - Записывает вариант в заголовок запроса `x-<cookieName>`.
+3. Nitro выбирает запись кеша по URL и заголовкам из `cache.varies`:
+   - Если кеш свежий, возвращает готовый HTML.
+   - Если кеш устарел, но ещё допустим, возвращает HTML и запускает обновление в фоне.
+   - Если подходящего кеша нет, запускает генерацию HTML и ожидает результат.
+4. При генерации HTML, в том числе при фоновом обновлении:
+   - Nuxt-плагин восстанавливает cookies из доступных заголовков экспериментов.
+   - SSR читает вариант через `useExperimentVariant()`.
+   - Сгенерированный HTML сохраняется в кеше.
+5. Браузер получает HTML и применяет `Set-Cookie` из ответа.
+6. При гидратации `useExperimentVariant()` читает cookie браузера через `useCookie()`.
 
-При фоновой регенерации также выполняются Nuxt-плагин и SSR. При обычной выдаче готового кеша они не запускаются, но Nitro middleware обрабатывает запрос до кеша и может выставить cookies текущему посетителю.
+Middleware выполняется и при попадании в кеш.
 
-## 1. Назначение варианта в Nitro
+Плагин и SSR выполняются только при генерации ответа.
 
-Файл: [`server/middleware/00-experiment-cookie.ts`](server/middleware/00-experiment-cookie.ts).
+У каждого эксперимента две cookies:
 
-Middleware обрабатывает `GET` и `HEAD`. Внутри `assignExperimentVariant()`:
+- `<cookieName>-bucket` — случайное число в `[0, 1)`, создаваемое при отсутствии или некорректном значении;
+- `<cookieName>` — `b`, если `bucket < probabilityB`, иначе `a`.
 
-1. Читается cookie `catalog-variant-bucket` — число в диапазоне `[0, 1)`.
-2. Если cookie отсутствует или содержит некорректное значение, создаётся новый bucket через `Math.random()` и отправляется браузеру через `Set-Cookie`.
-3. `pickVariant(0.2, bucket)` выбирает `b`, если `bucket < 0.2`, иначе `a`. Это даёт примерно 20% посетителей в группе `b`.
-4. Если cookie `catalog-variant` отличается от вычисленного варианта, middleware отправляет её актуальное значение через `Set-Cookie`.
-5. В **заголовок запроса** записывается `x-catalog-variant`. Это происходит **до выбора кеша**. Входящее значение этого заголовка заменяется вычисленным вариантом.
-6. Такой же заголовок добавляется в ответ для удобства проверки в DevTools.
+При сохранённом bucket и неизменной вероятности вариант стабилен. Изменение `probabilityB` пересчитывает только соответствующий эксперимент.
 
-Bucket позволяет сохранять назначение между запросами при неизменном пороге эксперимента. Если изменить вероятность `b`, вариант пересчитается из того же bucket. Поэтому источником назначения служит bucket, а `catalog-variant` хранит результат расчёта.
+## Основные компоненты
 
-Имя cookie объявлено в [`shared/utils/constants.ts`](shared/utils/constants.ts) и используется middleware, плагином и компонентом.
+Все пути ниже относятся к `modules/ab-experiment/`.
 
-### Опции cookies
-
-Обе cookies выставляются через `setCookie()` с опциями:
-
-| Опция | Значение |
+| Файл | Ответственность |
 | --- | --- |
-| `path` | `/` |
-| `sameSite` | `lax` |
-| `maxAge` | 30 дней, в секундах |
-| `secure` | `false` в dev, `true` вне dev |
+| [`module.ts`](modules/ab-experiment/module.ts) | Регистрирует middleware, серверный плагин и автоимпорт composable; заполняет `runtimeConfig`. |
+| [`config.ts`](modules/ab-experiment/config.ts) | Проверяет настройки и конфликты имён, объединяет cookie-опции, сериализует `expires`. |
+| [`types.ts`](modules/ab-experiment/types.ts) | Типы экспериментов, вариантов и cookie-опций. |
+| [`utils.ts`](modules/ab-experiment/utils.ts) | Формирует имя заголовка через `getExperimentHeaderName()`, проверяет вероятность. |
+| [`runtime/server/middleware/assign-experiment.ts`](modules/ab-experiment/runtime/server/middleware/assign-experiment.ts) | Назначает bucket и вариант, выставляет cookies и заголовки до кеша. |
+| [`runtime/app/plugins/restore-experiment-cookie.server.ts`](modules/ab-experiment/runtime/app/plugins/restore-experiment-cookie.server.ts) | Восстанавливает cookies только из доступных заголовков экспериментов перед SSR. |
+| [`runtime/app/composables/useExperimentVariant.ts`](modules/ab-experiment/runtime/app/composables/useExperimentVariant.ts) | Публичный API для компонентов и composables приложения. |
 
-`httpOnly` не включён: клиентский `useCookie()` должен иметь доступ к `catalog-variant` через `document.cookie`. Вне dev для cookies с `Secure` нужен HTTPS.
+Полные настройки находятся в `runtimeConfig.abExperiment.experiments`. В `runtimeConfig.public.abExperiment.experiments` передаются только идентификаторы экспериментов и имена cookies.
 
-`Set-Cookie` меняет cookies браузера после получения ответа. Сам по себе вызов `setCookie()` не добавляет значение во входящий заголовок `Cookie` текущего запроса.
+## Настройка
 
-## 2. Разделение кеша по варианту
-
-Файл: [`nuxt.config.ts`](nuxt.config.ts).
+Пример из [`nuxt.config.ts`](nuxt.config.ts):
 
 ```ts
-routeRules: {
-  '/': {
-    swr: 600,
-    cache: { staleMaxAge: 3600, varies: ['x-catalog-variant'] },
-    headers: { Vary: 'x-catalog-variant' },
+import { getExperimentHeaderName } from './modules/ab-experiment/utils'
+import type { ExperimentOptions } from './modules/ab-experiment/types'
+
+const experiments = {
+  catalog: {
+    cookieName: 'catalog-variant',
+    probabilityB: 0.2,
   },
+  checkout: {
+    cookieName: 'checkout-variant',
+    probabilityB: 0.5,
+    cookieOptions: { maxAge: 60 * 60 * 24 * 7 },
+  },
+} satisfies Record<string, ExperimentOptions>
+
+const catalogHeader = getExperimentHeaderName(experiments.catalog.cookieName)
+const checkoutHeader = getExperimentHeaderName(experiments.checkout.cookieName)
+
+export default defineNuxtConfig({
+  modules: ['./modules/ab-experiment/module'],
+  abExperiment: {
+    experiments,
+    cookieOptions: { sameSite: 'lax' },
+  },
+  routeRules: {
+    '/': {
+      swr: 600,
+      cache: { staleMaxAge: 3600, varies: [catalogHeader] },
+      headers: { Vary: catalogHeader },
+    },
+    '/checkout': {
+      swr: 600,
+      cache: { staleMaxAge: 3600, varies: [checkoutHeader] },
+      headers: { Vary: checkoutHeader },
+    },
+  },
+})
+```
+
+`experiments` по умолчанию пуст. Для каждого эксперимента обязательны `cookieName` и `probabilityB` от `0` до `1`.
+
+Имена cookies, bucket-cookies и заголовков не должны конфликтовать.
+
+### Cookie-опции
+
+Приоритет: **дефолты → общие `abExperiment.cookieOptions` → `experiments[id].cookieOptions`**. Итоговые опции применяются к варианту и bucket.
+
+```ts
+// Дефолты в assign-experiment.ts
+{
+  path: '/',
+  sameSite: 'lax',
+  maxAge: 60 * 60 * 24 * 30,
+  secure: !import.meta.dev,
 }
 ```
 
-- `swr: 600` задаёт время свежести кеша — 600 секунд.
-- `staleMaxAge: 3600` разрешает выдачу устаревшего ответа в течение дополнительного периода с обновлением в фоне.
-- `cache.varies` включает `x-catalog-variant` в ключ кеша Nitro. URL также участвует в ключе; для одного URL ответы разделяются по вариантам `a` и `b`.
-- `headers.Vary` задаёт HTTP-заголовок для внешних кешей. Само разделение внутреннего кеша Nitro настраивает именно `cache.varies`.
+Поддерживаются опции `setCookie()` из H3, кроме функции `encode`. `false` и `0` сохраняются, `undefined` не переопределяет предыдущий уровень. `expires` задаётся как `Date`; при наличии `maxAge` браузер отдаёт ему приоритет.
 
-Заголовок `Cookie` не добавляется в `varies`, иначе разные bucket и остальные cookies создавали бы отдельные записи вместо общего кеша на вариант.
+Cookie варианта должна быть доступна через `document.cookie`: `httpOnly: true` несовместим с текущей гидратацией, а `path`/`domain` должны соответствовать странице. Для `secure: true` нужен HTTPS; вне dev этот флаг включён по умолчанию.
 
-Внешний кеш должен видеть `x-catalog-variant` в запросе до собственного выбора записи. Изменение заголовка внутри Nitro не меняет исходный запрос, который уже прошёл через CDN или прокси; один `Vary` не организует назначение варианта на этих уровнях.
+Опции хранения передаются через `Set-Cookie` из middleware. Плагин меняет только локальный заголовок `Cookie` SSR-запроса: он не записывает cookies браузера и не меняет уже выбранный ключ кеша.
 
-## 3. Восстановление cookie перед SSR
+## Использование в приложении
 
-Файл: [`app/plugins/restore-experiment-cookie.server.ts`](app/plugins/restore-experiment-cookie.server.ts).
+`useExperimentVariant()` автоимпортируется Nuxt. Аргумент — ключ из `abExperiment.experiments`, а не имя cookie.
 
-При генерации кешируемого ответа Nitro создаёт отдельный event: сохраняет только заголовки запроса из `cache.varies`, а для ответа использует отдельный набор заголовков. Поэтому входящий `Cookie` и выставленный middleware `Set-Cookie` недоступны серверному `useCookie()` внутри этого рендера. Зато `x-catalog-variant` сохраняется.
+```vue
+<script setup lang="ts">
+const { variant, isA, isB } = useExperimentVariant('catalog')
+</script>
 
-Серверный Nuxt-плагин с `enforce: 'pre'` выполняется до рендера компонентов и:
-
-1. Читает назначенный вариант из `x-catalog-variant`.
-2. Разбирает доступный на этот момент заголовок `Cookie` через `parse()`.
-3. Добавляет или заменяет только `catalog-variant`.
-4. Собирает заголовок обратно через `serialize()`.
-
-Это изменение **локального SSR-запроса**, а не запись cookie в браузер. Ключ кеша уже выбран, поэтому восстановленный `Cookie` не добавляет новых измерений кеширования.
-
-В заголовке запроса cookies представлены только парами `имя=значение`:
-
-```http
-Cookie: catalog-variant=a
+<template>
+  <div>
+    <p>Вариант: {{ variant }}</p>
+    <p v-if="isA">Каталог A</p>
+    <p v-else-if="isB">Каталог B</p>
+  </div>
+</template>
 ```
 
-Опции `SameSite`, `Max-Age`, `Path`, `Secure` относятся к `Set-Cookie` в ответе и задаются middleware. Повторять их в плагине не нужно.
+Возвращаемые значения:
 
-Разбор и сборка заголовка сохраняют остальные cookies, если они доступны плагину, и исключают дублирование имени при замене. Однако cookies, которые Nitro уже отфильтровал, плагин не восстанавливает. Он восстанавливает только вариант, однозначно определяемый заголовком кеша. Персональный bucket не должен влиять на общий HTML варианта.
+- `variant` — readonly ref со значением `'a' | 'b' | undefined`;
+- `isA`, `isB` — computed refs; при отсутствии cookie оба равны `false`.
 
-## 4. Чтение в компоненте и гидратация
-
-Файл: [`app/app.vue`](app/app.vue).
+Пример в другом composable:
 
 ```ts
-const variant = useCookie(COOKIE_NAME_CATALOG_VARIANT)
+export function useCheckoutExperiment () {
+  const { variant, isB } = useExperimentVariant('checkout')
+  const checkoutTitle = computed(() => isB.value ? 'Checkout B' : 'Checkout A')
+
+  return { variant, checkoutTitle }
+}
 ```
 
-При SSR `useCookie()` читает восстановленную плагином cookie. В браузере он читает cookie, выставленную Nitro middleware. При согласованных cookies браузера оба этапа получают один вариант: HTML из кеша `a` соответствует cookie `a`, HTML из кеша `b` — cookie `b`.
+Вызывать в `setup` или composable в контексте Nuxt. В script значения refs читаются через `.value`, в template разворачиваются автоматически. Отсутствующая конфигурация модуля или неизвестный идентификатор приводят к ошибке с пояснением.
 
-Без восстановления cookie сервер мог бы отрендерить пустое значение, а браузер — `a` или `b`. Это приводит к ошибке гидратации.
+## Правила кеширования
 
-### Старый HTML после изменения кода
+- В `cache.varies` нужны заголовки **всех экспериментов, влияющих на HTML маршрута**. Для двух экспериментов на одной странице — до четырёх комбинаций кеша; `Vary` перечисляет заголовки через запятую.
+- `swr: 600` задаёт 600 секунд свежести; `staleMaxAge: 3600` — дополнительный период выдачи устаревшего ответа с обновлением в фоне.
+- `cache.varies` управляет кешем Nitro, `Vary` — внешними HTTP-кешами. CDN должен получать вариант до собственного выбора кеша: заголовок, добавленный внутри Nitro, этого не обеспечивает.
+- После изменений SSR или конфигурации старые SWR-ответы могут сохраняться. Перезапуск dev-сервера очищает кеш в памяти; постоянное хранилище очищается отдельно. После изменения модуля нужна полная перезагрузка страницы, чтобы клиент получил актуальный runtime config.
 
-Изменение плагина через HMR не обязательно сбрасывает готовые записи SWR-кеша. Даже исправленный код может некоторое время сопровождаться ошибкой гидратации: первый запрос получает старый HTML, пока Nitro обновляет его в фоне.
+## Команды
 
-При проверке изменений SSR нужно сбросить соответствующий серверный кеш. Для кеша в памяти dev-сервера достаточно перезапуска; при использовании постоянного хранилища требуется очистить записи в нём. Отключение кеша браузера в DevTools само по себе не очищает кеш Nitro.
+```bash
+bun install
+bun run dev      # http://localhost:3000
+bun run build   # production-сборка
+bun run preview # просмотр сборки
+bun run test    # сборка + HTTP-тесты
+```
+
+Тесты проверяют обе страницы, четыре сочетания вариантов, независимость кешей, первый и повторный визиты, cookie-опции и исправление некорректного bucket.
